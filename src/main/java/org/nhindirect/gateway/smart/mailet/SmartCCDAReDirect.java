@@ -24,7 +24,23 @@ import org.apache.mailet.base.GenericMailet;
 
 import org.nhindirect.gateway.smart.CCDAContent;
 
-
+/**
+ * The SMART C-CDA reDirect mailet.  This mailet inspects each message for C-CDA content and transports each potential C-CDA to a configured
+ * REST URI via an HTTP POST operation.  The URI is configured using the <b>CCDAPostUrl<b> mailet configuration parameter.
+ * <p>
+ * The REST URI supports template parameters based on the sender and receiver of the message.  The URI uses the templates {to} and {from}
+ * to indicate the respective addresses.  For example, the URI template
+ * <br>
+ * <pre>
+ * http://my-server.com/incoming/ccda/for-user/{to}
+ * </pre>
+ * <br>
+ * would POST each found C-CDA to the URI based on the recipient's email address.
+ * <p>
+ * This class is a mailet interpretation of the <a href="https://github.com/jmandel/ccda-reDirect">SMART reDirect service</a>
+ * @author Greg Meyer
+ * @since 1.0
+ */
 public class SmartCCDAReDirect extends GenericMailet
 {
 	private static final Log LOGGER = LogFactory.getFactory().getInstance(SmartCCDAReDirect.class);	
@@ -59,16 +75,28 @@ public class SmartCCDAReDirect extends GenericMailet
 		}
 	}
 	
+	/**
+	 * Creates the camel context used for creating producer templates.
+	 * @return The camel context used for creating producer templates.
+	 */
 	protected CamelContext createCamelContext()
 	{
 		return new DefaultCamelContext();
 	}
 	
+	/**
+	 * Creates a default camel exchange object from a camel context.
+	 * @param context The camel context.
+	 * @return A camel exchange used for sending
+	 */
 	protected Exchange createCamelExchange(CamelContext context)
 	{
 		return new DefaultExchange(context);
 	}
 	
+	/**
+	 * {@inheritDoc}
+	 */
 	@Override
 	public void service(Mail mail) throws MessagingException 
 	{	
@@ -149,9 +177,15 @@ public class SmartCCDAReDirect extends GenericMailet
 		{
 			template.stop();
 		}
-		catch (Exception e) {};
+		catch (Exception e) {/* no-op */};
 	}
 	
+	/**
+	 * Creates a collection of URLs to post C-CDAs to based on the configured URI template, the message sender, and message recipients.
+	 * @param recips Message recipients.
+	 * @param sender Message sender.
+	 * @return Collection of URIs to post the C-CDA to.
+	 */
 	protected Collection<String> getPostToURLs(Collection<InternetAddress> recips, InternetAddress sender)
 	{
 		final Collection<String> retVal = new ArrayList<String>();
@@ -176,6 +210,13 @@ public class SmartCCDAReDirect extends GenericMailet
 		return retVal;
 	}
 	
+	/**
+	 * Get the list of message recipients.  Recipients are first determined using the SMTP envelope then falls back to the message
+	 * headers if the recipients cannot be determined from the SMTP envelope.
+	 * @param mail The mail message.
+	 * @return Collection of message recipients. 
+	 * @throws MessagingException
+	 */
 	@SuppressWarnings("unchecked")
 	protected Collection<InternetAddress> getMailRecipients(Mail mail) throws MessagingException
 	{
@@ -203,7 +244,14 @@ public class SmartCCDAReDirect extends GenericMailet
 		return recipients;
 	}
 	
-	public static InternetAddress getSender(Mail mail) 
+	/**
+	 * Get the message sender.  The sender is first determined using the SMTP envelope then falls back to the message
+	 * headers if the sender cannot be determined from the SMTP envelope.
+	 * @param mail The mail message.
+	 * @return The message sender.
+	 * @throws MessagingException
+	 */
+	protected static InternetAddress getSender(Mail mail) 
 	{
 		InternetAddress retVal = null;
 		
