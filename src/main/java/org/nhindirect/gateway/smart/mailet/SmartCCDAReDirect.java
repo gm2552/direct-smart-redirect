@@ -4,10 +4,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 
-import javax.mail.Address;
 import javax.mail.BodyPart;
 import javax.mail.MessagingException;
 import javax.mail.internet.InternetAddress;
+import javax.mail.internet.MimeMessage;
 
 
 import org.apache.camel.CamelContext;
@@ -19,11 +19,23 @@ import org.apache.camel.impl.DefaultExchange;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.mailet.Mail;
-import org.apache.mailet.MailAddress;
-import org.apache.mailet.base.GenericMailet;
 
+import org.nhindirect.common.tx.TxUtil;
+import org.nhindirect.common.tx.model.Tx;
+import org.nhindirect.common.tx.model.TxMessageType;
 import org.nhindirect.gateway.smart.CCDAContent;
+import org.nhindirect.gateway.smtp.NotificationProducer;
+import org.nhindirect.gateway.smtp.NotificationSettings;
+import org.nhindirect.gateway.smtp.ReliableDispatchedNotificationProducer;
+import org.nhindirect.gateway.smtp.dsn.DSNCreator;
+import org.nhindirect.gateway.smtp.dsn.provider.FailedDeliveryDSNCreatorProvider;
+import org.nhindirect.gateway.smtp.james.mailet.AbstractNotificationAwareMailet;
+import org.nhindirect.stagent.NHINDAddress;
+import org.nhindirect.stagent.NHINDAddressCollection;
+import org.nhindirect.stagent.mail.Message;
+import org.nhindirect.stagent.mail.notifications.NotificationMessage;
 
+import com.google.inject.Provider;
 /**
  * The SMART C-CDA reDirect mailet.  This mailet inspects each message for C-CDA content and transports each potential C-CDA to a configured
  * REST URI via an HTTP POST operation.  The URI is configured using the <b>CCDAPostUrl<b> mailet configuration parameter.
@@ -41,13 +53,18 @@ import org.nhindirect.gateway.smart.CCDAContent;
  * @author Greg Meyer
  * @since 1.0
  */
-public class SmartCCDAReDirect extends GenericMailet
+public class SmartCCDAReDirect extends AbstractNotificationAwareMailet
 {
 	private static final Log LOGGER = LogFactory.getFactory().getInstance(SmartCCDAReDirect.class);	
 	
 	String contextDefFile;
 	String postURLTemplate;
 	CamelContext context;
+	boolean ghostAllMessages;
+	boolean bounceFailedPosts;
+	
+	// adding to support the implementation guide for delivery notification
+	protected NotificationProducer notificationProducer;
 	
 	/**
 	 * {@inheritDoc}
@@ -59,7 +76,13 @@ public class SmartCCDAReDirect extends GenericMailet
 		super.init();
 		
 		postURLTemplate = this.getInitParameter("CCDAPostUrl");
-				
+		final String ghostMessageSetting = this.getInitParameter("GhostCDAMessages", "false");
+		final String bounceFailuresSetting = this.getInitParameter("BounceFailedPosts", "true");
+		
+		ghostAllMessages = Boolean.parseBoolean(ghostMessageSetting);
+		bounceFailedPosts = Boolean.parseBoolean(bounceFailuresSetting);
+			
+		// make sure we have POST URL configured
 		if (postURLTemplate == null || postURLTemplate.isEmpty())
 			throw new MessagingException("CCDAPostUrl parameter cannot be empty.");
 		
@@ -73,6 +96,9 @@ public class SmartCCDAReDirect extends GenericMailet
 		{
 			throw new MessagingException("Failed to start camel context.", e);
 		}
+		
+		notificationProducer = new ReliableDispatchedNotificationProducer(new NotificationSettings(true, "Local Direct Delivery Agent", "Your message was successfully dispatched."));
+
 	}
 	
 	/**
@@ -102,14 +128,24 @@ public class SmartCCDAReDirect extends GenericMailet
 	{	
 		LOGGER.info("Servicing CCDA reDirect");
 		
+		final MimeMessage msg = mail.getMessage();
+		
+		boolean dispatchSuccessful = false;
+		
+		// checking to see if we need to respond with the dispatch MDN
+		// in compliance with the implementation guide for delivery notification
+		final boolean isReliableAndTimely = TxUtil.isReliableAndTimelyRequested(msg);
+		
 		// could use a split and send EIP, but for simplicity we will split the message
 		// into the CCDA parts and use a URL template right here in line
 		
-		final Collection<BodyPart> ccdaParts = CCDAContent.getCCDAParts(mail.getMessage());
+		final Collection<BodyPart> ccdaParts = CCDAContent.getCCDAParts(msg);
 		
 		// get the list of recipients and sender
-		Collection<InternetAddress> recips = getMailRecipients(mail);
-		InternetAddress sender = getSender(mail);
+		final NHINDAddressCollection recips = getMailRecipients(mail);
+		final NHINDAddress sender = getMailSender(mail);
+		
+		final Tx txToTrack = this.getTxToTrack(msg, sender, recips);
 		
 		final Collection<String> postToURLs = getPostToURLs(recips, sender);
 		
@@ -154,6 +190,39 @@ public class SmartCCDAReDirect extends GenericMailet
 						if (responseCode >= 200 && responseCode < 300)
 						{
 							LOGGER.info("Successfully sent CCDA to endpoint " + postToURL);
+							dispatchSuccessful = true;
+							
+							// send the MDN dispatched messages if the notification IG was 
+							// invoked by the sender
+							if (isReliableAndTimely && txToTrack.getMsgType() == TxMessageType.IMF)
+							{
+
+								// send back an MDN dispatched message
+								final Collection<NotificationMessage> notifications = 
+										notificationProducer.produce(new Message(msg), recips.toInternetAddressCollection());
+								if (notifications != null && notifications.size() > 0)
+								{
+									LOGGER.debug("Sending MDN \"dispatched\" messages");
+									// create a message for each notification and put it on James "stack"
+									for (NotificationMessage message : notifications)
+									{
+										try
+										{
+											message.saveChanges();
+
+											
+											getMailetContext().sendMail(message);
+										}
+										///CLOVER:OFF
+										catch (Throwable t)
+										{
+											// don't kill the process if this fails
+											LOGGER.error("Error sending MDN dispatched message.", t);
+										}
+										///CLOVER:ON
+									}
+								}
+							}
 						}
 						else
 						{
@@ -170,14 +239,26 @@ public class SmartCCDAReDirect extends GenericMailet
 			{
 				LOGGER.error("Failed to reDirect CCDA.", e);
 			}
-			
+			finally
+			{
+				// stop the message flow for CDA messages
+				if (this.ghostAllMessages)
+					mail.setState(Mail.GHOST);
+			}
 		}
 		
+		// bounce the message if configured to do so if dispatch failed and GHOST it
+		if (!dispatchSuccessful && bounceFailedPosts && txToTrack != null && txToTrack.getMsgType() == TxMessageType.IMF)
+		{
+			this.sendDSN(txToTrack, recips, false);
+			mail.setState(Mail.GHOST);
+		}
+	
 		try
 		{
 			template.stop();
 		}
-		catch (Exception e) {/* no-op */};
+		catch (Exception e) {};
 	}
 	
 	/**
@@ -186,7 +267,7 @@ public class SmartCCDAReDirect extends GenericMailet
 	 * @param sender Message sender.
 	 * @return Collection of URIs to post the C-CDA to.
 	 */
-	protected Collection<String> getPostToURLs(Collection<InternetAddress> recips, InternetAddress sender)
+	protected Collection<String> getPostToURLs(NHINDAddressCollection recips, InternetAddress sender)
 	{
 		final Collection<String> retVal = new ArrayList<String>();
 		
@@ -208,77 +289,15 @@ public class SmartCCDAReDirect extends GenericMailet
 		}
 		
 		return retVal;
-	}
-	
+	}	
+
 	/**
-	 * Get the list of message recipients.  Recipients are first determined using the SMTP envelope then falls back to the message
-	 * headers if the recipients cannot be determined from the SMTP envelope.
-	 * @param mail The mail message.
-	 * @return Collection of message recipients. 
-	 * @throws MessagingException
+	 * {@inheritDoc}
 	 */
-	@SuppressWarnings("unchecked")
-	protected Collection<InternetAddress> getMailRecipients(Mail mail) throws MessagingException
+	@Override
+	protected Provider<DSNCreator> getDSNProvider() 
 	{
-		final Collection<InternetAddress> recipients = new ArrayList<InternetAddress>();		
-		
-		// uses the RCPT TO commands
-		final Collection<MailAddress> recips = mail.getRecipients();
-		if (recips == null || recips.size() == 0)
-		{
-			// fall back to the mime message list of recipients
-			final Address[] recipsAddr = mail.getMessage().getAllRecipients();
-			for (Address addr : recipsAddr)
-			{
-				recipients.add((InternetAddress)addr);
-			}
-		}
-		else
-		{
-			for (MailAddress addr : recips)
-			{
-				recipients.add(addr.toInternetAddress());
-			}
-		}
-		
-		return recipients;
+		return new FailedDeliveryDSNCreatorProvider(this);
 	}
 	
-	/**
-	 * Get the message sender.  The sender is first determined using the SMTP envelope then falls back to the message
-	 * headers if the sender cannot be determined from the SMTP envelope.
-	 * @param mail The mail message.
-	 * @return The message sender.
-	 * @throws MessagingException
-	 */
-	protected static InternetAddress getSender(Mail mail) 
-	{
-		InternetAddress retVal = null;
-		
-		if (mail.getSender() != null)
-			retVal = mail.getSender().toInternetAddress();	
-		else
-		{
-			// try to get the sender from the message
-			Address[] senderAddr = null;
-			try
-			{
-				if (mail.getMessage() == null)
-					return null;
-				
-				senderAddr = mail.getMessage().getFrom();
-				if (senderAddr == null || senderAddr.length == 0)
-					return null;
-			}
-			catch (MessagingException e)
-			{
-				return null;
-			}
-						
-			// not the best way to do this
-			retVal = (InternetAddress)senderAddr[0];	
-		}
-	
-		return retVal;
-	}
 }
